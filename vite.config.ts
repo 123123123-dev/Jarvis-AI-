@@ -5,8 +5,10 @@ import { defineConfig } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
+  const base = process.env.GITHUB_PAGES === 'true' ? '/Jarvis-AI-/' : '/';
+
   return {
-    base: '/',
+    base,
     plugins: [
       react(),
       tailwindcss(),
@@ -14,7 +16,7 @@ export default defineConfig(() => {
         registerType: 'autoUpdate',
         includeAssets: ['icon.svg', 'jarvis-app-icon.png', 'jarvis-welcome-bg.png'],
         manifest: {
-          id: '/',
+          id: base,
           name: 'JARVIS AI',
           short_name: 'JARVIS AI',
           description:
@@ -22,8 +24,8 @@ export default defineConfig(() => {
           theme_color: '#060b13',
           background_color: '#060b13',
           display: 'standalone',
-          start_url: '/',
-          scope: '/',
+          start_url: base,
+          scope: base,
           icons: [
             {
               src: 'jarvis-app-icon.png',
