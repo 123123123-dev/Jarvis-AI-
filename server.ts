@@ -1,0 +1,1011 @@
+import express, { type NextFunction, type Request, type Response } from 'express';
+import { GoogleGenAI } from '@google/genai';
+import dotenv from 'dotenv';
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
+import postgres from 'postgres';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+app.set('trust proxy', 1);
+
+// Body parsers with increased limits for multi-file attachments (up to 10 files)
+app.use(express.json({ limit: '60mb' }));
+app.use(express.urlencoded({ extended: true, limit: '60mb' }));
+
+// Initialize GoogleGenAI SDK with server-side API key
+const apiKey = process.env.GEMINI_API_KEY || '';
+const ai = new GoogleGenAI({
+  apiKey: apiKey || 'AIzaSyPlaceholderKeyForBuild',
+});
+
+const databaseUrlEnvironmentVariable = [
+  'SUPABASE_DB_URL',
+  'SUPABASE_DATABASE_URL',
+  'POSTGRES_URL',
+  'POSTGRES_PRISMA_URL',
+  'DATABASE_URL',
+  'POSTGRES_URL_NON_POOLING',
+].find((name) => process.env[name]);
+const databaseUrl = databaseUrlEnvironmentVariable
+  ? process.env[databaseUrlEnvironmentVariable]
+  : undefined;
+const postgresDatabase = databaseUrl
+  ? postgres(databaseUrl, { ssl: 'require', max: 1, idle_timeout: 20, prepare: false })
+  : undefined;
+let sqliteDatabase: DatabaseSync | undefined;
+
+const schemaStatements = [
+  `CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at BIGINT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS direct_sign_in_links (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at BIGINT NOT NULL,
+    used_at BIGINT
+  )`,
+  `CREATE TABLE IF NOT EXISTS conversations (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (user_id, conversation_id)
+  )`,
+];
+
+type DatabaseParameter = SQLInputValue;
+
+function postgresStatement(statement: string): string {
+  let parameterIndex = 0;
+  return statement.replace(/\?/g, () => `$${++parameterIndex}`);
+}
+
+async function databaseGet<T>(
+  statement: string,
+  ...parameters: DatabaseParameter[]
+): Promise<T | undefined> {
+  if (postgresDatabase) {
+    const rows = await postgresDatabase.unsafe(postgresStatement(statement), parameters);
+    return rows[0] as T | undefined;
+  }
+  if (!sqliteDatabase) throw new Error('SUPABASE_DB_URL or DATABASE_URL is required for Vercel deployments.');
+  return sqliteDatabase.prepare(statement).get(...parameters) as T | undefined;
+}
+
+async function databaseAll<T>(
+  statement: string,
+  ...parameters: DatabaseParameter[]
+): Promise<T[]> {
+  if (postgresDatabase) {
+    const rows = await postgresDatabase.unsafe(postgresStatement(statement), parameters);
+    return rows as unknown as T[];
+  }
+  if (!sqliteDatabase) throw new Error('SUPABASE_DB_URL or DATABASE_URL is required for Vercel deployments.');
+  return sqliteDatabase.prepare(statement).all(...parameters) as T[];
+}
+
+async function databaseRun(
+  statement: string,
+  ...parameters: DatabaseParameter[]
+): Promise<void> {
+  if (postgresDatabase) {
+    await postgresDatabase.unsafe(postgresStatement(statement), parameters);
+    return;
+  }
+  if (!sqliteDatabase) throw new Error('SUPABASE_DB_URL or DATABASE_URL is required for Vercel deployments.');
+  sqliteDatabase.prepare(statement).run(...parameters);
+}
+
+async function databaseTransaction(
+  action: (run: typeof databaseRun) => Promise<void>,
+): Promise<void> {
+  if (postgresDatabase) {
+    await postgresDatabase.begin(async (transaction) => {
+      await action(async (statement, ...parameters) => {
+        await transaction.unsafe(postgresStatement(statement), parameters);
+      });
+    });
+    return;
+  }
+  if (!sqliteDatabase) throw new Error('SUPABASE_DB_URL or DATABASE_URL is required for Vercel deployments.');
+
+  sqliteDatabase.exec('BEGIN');
+  try {
+    await action(databaseRun);
+    sqliteDatabase.exec('COMMIT');
+  } catch (error) {
+    sqliteDatabase.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+async function initializeDatabase(): Promise<void> {
+  if (postgresDatabase) {
+    for (const statement of schemaStatements) {
+      await postgresDatabase.unsafe(statement);
+    }
+  } else if (!process.env.VERCEL) {
+    const { DatabaseSync: SQLiteDatabase } = await import('node:sqlite');
+    const databasePath = process.env.JARVIS_DATABASE_PATH || path.resolve('data/jarvis.sqlite');
+    mkdirSync(path.dirname(databasePath), { recursive: true });
+    sqliteDatabase = new SQLiteDatabase(databasePath);
+    sqliteDatabase.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
+    for (const statement of schemaStatements) sqliteDatabase.exec(statement);
+  }
+}
+
+const databaseReady = initializeDatabase();
+
+interface AccountRecord {
+  id: string;
+  name: string;
+  email: string;
+  password_salt: string;
+  password_hash: string;
+}
+
+interface PublicAccount {
+  id: string;
+  name: string;
+  email: string;
+  isGuest: false;
+}
+
+const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+const DIRECT_LINK_EXPIRY = Number.MAX_SAFE_INTEGER;
+const authAttempts = new Map<string, { count: number; resetAt: number }>();
+
+app.use(['/api/auth', '/api/conversations'], async (_req, res, next) => {
+  try {
+    if (!postgresDatabase && !sqliteDatabase) {
+      throw new Error('A supported Postgres connection string is required for Vercel account storage.');
+    }
+    await databaseReady;
+    next();
+  } catch (error) {
+    console.error('Database initialization failed:', (error as Error).message);
+    const message = databaseUrl
+      ? 'The configured database could not be reached or initialized. Check the Supabase connection string, password, and database permissions.'
+      : 'No database connection variable was found. Set SUPABASE_DB_URL in Vercel Production and redeploy.';
+    res.status(503).json({ error: message });
+  }
+});
+
+function publicAccount(account: AccountRecord): PublicAccount {
+  return { id: account.id, name: account.name, email: account.email, isGuest: false };
+}
+
+function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+async function createAccountSession(account: AccountRecord): Promise<{ user: PublicAccount; token: string }> {
+  const token = randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + SESSION_DURATION_MS;
+  await databaseRun(
+    'INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)',
+    hashToken(token),
+    account.id,
+    expiresAt,
+  );
+  return { user: publicAccount(account), token };
+}
+
+async function accountFromRequest(req: Request): Promise<AccountRecord | undefined> {
+  const authorization = req.headers.authorization || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  if (!token) return undefined;
+
+  const session = await databaseGet<{ user_id: string }>(
+    'SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?',
+    hashToken(token),
+    Date.now(),
+  );
+  if (!session) return undefined;
+
+  return databaseGet<AccountRecord>(
+    'SELECT id, name, email, password_salt, password_hash FROM users WHERE id = ?',
+    session.user_id,
+  );
+}
+
+async function requireAccount(req: Request, res: Response): Promise<AccountRecord | undefined> {
+  const account = await accountFromRequest(req);
+  if (!account) res.status(401).json({ error: 'Please sign in to access this account.' });
+  return account;
+}
+
+function asyncRoute(handler: (req: Request, res: Response) => Promise<unknown>): (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => void {
+  return (req, res, next) => {
+    void handler(req, res).catch(next);
+  };
+}
+
+function limitAuthAttempts(req: Request, res: Response, next: NextFunction) {
+  const now = Date.now();
+  const key = req.ip || 'unknown';
+  const attempt = authAttempts.get(key);
+  if (attempt && attempt.resetAt > now && attempt.count >= 10) {
+    return res.status(429).json({ error: 'Too many account attempts. Please wait and try again.' });
+  }
+  authAttempts.set(key, {
+    count: attempt && attempt.resetAt > now ? attempt.count + 1 : 1,
+    resetAt: attempt && attempt.resetAt > now ? attempt.resetAt : now + 15 * 60 * 1000,
+  });
+  next();
+}
+
+// Health check endpoint
+app.get('/api/health', async (_req, res) => {
+  const databaseConfigured = Boolean(postgresDatabase || sqliteDatabase);
+  let databaseIsReady = Boolean(sqliteDatabase);
+  if (postgresDatabase) {
+    try {
+      await databaseReady;
+      databaseIsReady = true;
+    } catch (error) {
+      console.error('Database health check failed:', (error as Error).message);
+    }
+  }
+
+  res.json({
+    status: databaseConfigured && databaseIsReady ? 'ok' : 'degraded',
+    service: 'JARVIS AI Engine',
+    aiConfigured: Boolean(apiKey && !apiKey.includes('Placeholder')),
+    databaseConfigured,
+    databaseReady: databaseIsReady,
+    databaseVariable: databaseUrlEnvironmentVariable || null,
+    time: new Date().toISOString(),
+  });
+});
+
+app.post('/api/auth/register', limitAuthAttempts, asyncRoute(async (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+  if (!name || name.length > 80) {
+    return res.status(400).json({ error: 'Name must be between 1 and 80 characters.' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    return res.status(400).json({ error: 'Enter a valid email address.' });
+  }
+  if (password.length < 12 || password.length > 128) {
+    return res.status(400).json({ error: 'Password must be between 12 and 128 characters.' });
+  }
+
+  const id = randomUUID();
+  const salt = randomBytes(16).toString('hex');
+  const passwordHash = scryptSync(password, salt, 64).toString('hex');
+  try {
+    await databaseRun(
+      'INSERT INTO users (id, name, email, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      id,
+      name,
+      email,
+      salt,
+      passwordHash,
+      Date.now(),
+    );
+    const account = await databaseGet<AccountRecord>(
+      'SELECT id, name, email, password_salt, password_hash FROM users WHERE id = ?',
+      id,
+    );
+    if (!account) throw new Error('Registered account could not be loaded.');
+    return res.status(201).json(await createAccountSession(account));
+  } catch (error) {
+    if (
+      `${(error as Error).message}`.includes('UNIQUE constraint failed') ||
+      (error as { code?: string }).code === '23505'
+    ) {
+      return res.status(409).json({ error: 'An account with this email already exists.' });
+    }
+    console.error('Account registration failed:', (error as Error).message);
+    return res.status(500).json({ error: 'Account registration failed. Please try again.' });
+  }
+}));
+
+app.post('/api/auth/login', limitAuthAttempts, asyncRoute(async (req, res) => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const account = await databaseGet<AccountRecord>(
+    'SELECT id, name, email, password_salt, password_hash FROM users WHERE email = ?',
+    email,
+  );
+  const candidateHash = scryptSync(password, account?.password_salt || 'jarvis-invalid-account-salt', 64);
+  const expectedHash = account ? Buffer.from(account.password_hash, 'hex') : Buffer.alloc(64);
+
+  if (!account || !timingSafeEqual(candidateHash, expectedHash)) {
+    return res.status(401).json({ error: 'Email or password is incorrect.' });
+  }
+
+  return res.json(await createAccountSession(account));
+}));
+
+app.post('/api/auth/direct-link', asyncRoute(async (req, res) => {
+  const account = await requireAccount(req, res);
+  if (!account) return;
+
+  const token = randomBytes(32).toString('hex');
+  const now = Date.now();
+  await databaseRun(
+    'DELETE FROM direct_sign_in_links WHERE user_id = ? OR expires_at <= ? OR used_at IS NOT NULL',
+    account.id,
+    now,
+  );
+  await databaseRun(
+    'INSERT INTO direct_sign_in_links (token_hash, user_id, expires_at) VALUES (?, ?, ?)',
+    hashToken(token),
+    account.id,
+    DIRECT_LINK_EXPIRY,
+  );
+  return res.json({ token });
+}));
+
+app.post('/api/auth/redeem-link', asyncRoute(async (req, res) => {
+  const token = typeof req.body?.token === 'string' ? req.body.token : '';
+  if (!/^[a-f0-9]{64}$/i.test(token)) {
+    return res.status(401).json({ error: 'This sign-in link is invalid, expired, or already used.' });
+  }
+
+  const now = Date.now();
+  const link = await databaseGet<{ user_id: string }>(
+    'SELECT user_id FROM direct_sign_in_links WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?',
+    hashToken(token),
+    now,
+  );
+  if (!link) {
+    return res.status(401).json({ error: 'This sign-in link is invalid, expired, or already used.' });
+  }
+
+  const account = await databaseGet<AccountRecord>(
+    'SELECT id, name, email, password_salt, password_hash FROM users WHERE id = ?',
+    link.user_id,
+  );
+  if (!account) return res.status(401).json({ error: 'This sign-in link is invalid, expired, or already used.' });
+  return res.json(await createAccountSession(account));
+}));
+
+app.get('/api/auth/me', asyncRoute(async (req, res) => {
+  const account = await accountFromRequest(req);
+  return res.json({ user: account ? publicAccount(account) : null });
+}));
+
+app.post('/api/auth/logout', asyncRoute(async (req, res) => {
+  const authorization = req.headers.authorization || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  if (token) {
+    const account = await accountFromRequest(req);
+    await databaseRun('DELETE FROM sessions WHERE token_hash = ?', hashToken(token));
+    if (account) {
+      await databaseRun('DELETE FROM direct_sign_in_links WHERE user_id = ?', account.id);
+    }
+  }
+  return res.json({ success: true });
+}));
+
+app.get('/api/conversations', asyncRoute(async (req, res) => {
+  const account = await requireAccount(req, res);
+  if (!account) return;
+  const rows = await databaseAll<{ payload: string }>(
+    'SELECT payload FROM conversations WHERE user_id = ? ORDER BY updated_at DESC',
+    account.id,
+  );
+  return res.json({ conversations: rows.map((row) => JSON.parse(row.payload)) });
+}));
+
+app.put('/api/conversations', asyncRoute(async (req, res) => {
+  const account = await requireAccount(req, res);
+  if (!account) return;
+  const conversations = req.body?.conversations;
+  if (!Array.isArray(conversations) || conversations.length > 500) {
+    return res.status(400).json({ error: 'Conversation data is invalid or exceeds the account limit.' });
+  }
+
+  const serializedConversations: Array<{ id: string; updatedAt: number; payload: string }> = [];
+  for (const conversation of conversations) {
+    if (!conversation || typeof conversation.id !== 'string' || conversation.id.length > 200) {
+      return res.status(400).json({ error: 'Conversation data contains an invalid entry.' });
+    }
+    serializedConversations.push({
+      id: conversation.id,
+      updatedAt: Number.isFinite(conversation.updatedAt) ? conversation.updatedAt : Date.now(),
+      payload: JSON.stringify(conversation),
+    });
+  }
+
+  if (serializedConversations.reduce((total, item) => total + item.payload.length, 0) > 50_000_000) {
+    return res.status(413).json({ error: 'Conversation history exceeds the account storage limit.' });
+  }
+
+  await databaseTransaction(async (run) => {
+    await run('DELETE FROM conversations WHERE user_id = ?', account.id);
+    for (const conversation of serializedConversations) {
+      await run(
+        'INSERT INTO conversations (user_id, conversation_id, updated_at, payload) VALUES (?, ?, ?, ?)',
+        account.id,
+        conversation.id,
+        conversation.updatedAt,
+        conversation.payload,
+      );
+    }
+  });
+  return res.json({ success: true });
+}));
+
+// Helper to determine if a prompt is an image generation request
+function isImagePrompt(text: string): boolean {
+  return /^\/image\b/i.test(text.trim()) ||
+    /\b(?:generate|create|make|draw|paint|illustrate|design)\b[\s\S]{0,120}\b(?:image|picture|artwork|illustration|photo|photograph|portrait|drawing|painting|wallpaper|logo|icon|graphic)\b/i.test(text) ||
+    /\b(?:draw|paint|illustrate)\b/i.test(text) ||
+    /\b(?:turn|transform|convert|restyle)\b[\s\S]{0,100}\b(?:into|as)\b/i.test(text);
+}
+
+interface ImageReference {
+  name?: string;
+  type?: string;
+  data?: string;
+}
+
+function imageErrorResponse(error: unknown): { status: number; message: string } {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  if (normalized.includes('429') || normalized.includes('resource_exhausted') || normalized.includes('quota')) {
+    return {
+      status: 429,
+      message: 'Image generation quota is unavailable. Check your Google AI project billing and image model quota, then try again.',
+    };
+  }
+  if (normalized.includes('safety') || normalized.includes('blocked') || normalized.includes('prohibited')) {
+    return {
+      status: 422,
+      message: 'The image provider blocked this request under its safety rules. Try a different, non-explicit prompt.',
+    };
+  }
+  if (normalized.includes('403') || normalized.includes('permission') || normalized.includes('api key')) {
+    return {
+      status: 403,
+      message: 'Your Google AI key cannot access the image model. Check the key, project, billing, and image-generation availability.',
+    };
+  }
+  if (normalized.includes('404') || normalized.includes('not found') || normalized.includes('not supported')) {
+    return {
+      status: 502,
+      message: 'The configured Google AI project does not currently have access to the image model.',
+    };
+  }
+  if (normalized.includes('timeout') || normalized.includes('aborted')) {
+    return {
+      status: 504,
+      message: 'Image generation took too long. Try again with a shorter prompt or a smaller reference image.',
+    };
+  }
+  return {
+    status: 502,
+    message: 'Google AI could not generate this image. Check the server logs and image model availability, then try again.',
+  };
+}
+
+async function generateArtwork(
+  prompt: string,
+  references: ImageReference[],
+  aspectRatio: string,
+): Promise<{ imageUrl: string; prompt: string }> {
+  const input = [
+    { type: 'text' as const, text: prompt },
+    ...references.map((reference) => ({
+      type: 'image' as const,
+      mime_type: reference.type!,
+      data: reference.data!.replace(/^data:[^,]*;base64,/, ''),
+    })),
+  ];
+
+  const interaction = await ai.interactions.create({
+    model: 'gemini-nano-banana-2.1',
+    input,
+    response_format: {
+      type: 'image',
+      mime_type: 'image/jpeg',
+      aspect_ratio: aspectRatio,
+      image_size: '1K',
+    },
+    store: false,
+  });
+  const imageBytes = interaction.output_image?.data;
+  if (!imageBytes) {
+    const reason = interaction.errors?.map((item) => item.message).filter(Boolean).join(' ');
+    throw new Error(reason || 'The image model returned no image. The prompt may have been blocked by safety filters.');
+  }
+  return { imageUrl: `data:image/jpeg;base64,${imageBytes}`, prompt };
+}
+
+// Generate AI artwork endpoint
+app.post('/api/generate-image', async (req, res) => {
+  try {
+    const { prompt, aspectRatio = '1:1', attachments = [] } = req.body;
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+    if (prompt.length > 5000) {
+      return res.status(413).json({ error: 'Image prompts must be 5,000 characters or fewer.' });
+    }
+
+    if (!apiKey || apiKey.includes('Placeholder')) {
+      return res.status(503).json({
+        error: 'AI image generation is not configured. Set GEMINI_API_KEY in the server environment.',
+      });
+    }
+
+    if (!Array.isArray(attachments) || attachments.length > 10) {
+      return res.status(400).json({ error: 'Attach up to 10 reference images.' });
+    }
+    const imageReferences: ImageReference[] = [];
+    for (const reference of attachments) {
+      if (!reference || typeof reference.data !== 'string' || typeof reference.type !== 'string' ||
+          !reference.type.startsWith('image/')) {
+        return res.status(400).json({ error: 'Image editing only accepts image reference files.' });
+      }
+      if (!/^image\/(png|jpeg|webp|heic|heif|gif|bmp|tiff)$/i.test(reference.type)) {
+        return res.status(400).json({ error: `The reference image type "${reference.type}" is not supported.` });
+      }
+      imageReferences.push(reference as ImageReference);
+    }
+    const supportedAspectRatios = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
+    const requestedAspectRatio = supportedAspectRatios.includes(aspectRatio) ? aspectRatio : '1:1';
+
+    const result = await generateArtwork(prompt.trim(), imageReferences, requestedAspectRatio);
+    return res.json({
+      success: true,
+      imageUrl: result.imageUrl,
+      prompt: result.prompt,
+      engine: 'Gemini Nano Banana',
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('JARVIS image request failed:', message.replace(apiKey, '[redacted]').slice(0, 500));
+    const failure = imageErrorResponse(error);
+    return res.status(failure.status).json({ error: failure.message });
+  }
+});
+
+app.get('/api/weather', asyncRoute(async (req, res) => {
+  const location = typeof req.query.location === 'string' ? req.query.location.trim() : '';
+  const requestedUnit = req.query.temperatureUnit;
+  if (requestedUnit !== undefined && requestedUnit !== 'celsius' && requestedUnit !== 'fahrenheit') {
+    return res.status(400).json({ error: 'Temperature unit must be celsius or fahrenheit.' });
+  }
+  const temperatureUnit = requestedUnit === 'fahrenheit' ? 'fahrenheit' : 'celsius';
+  if (!location || location.length > 100) {
+    return res.status(400).json({ error: 'Enter a city or place name (up to 100 characters).' });
+  }
+
+  try {
+    const geocodingUrl = new URL('https://geocoding-api.open-meteo.com/v1/search');
+    geocodingUrl.searchParams.set('name', location);
+    geocodingUrl.searchParams.set('count', '5');
+    geocodingUrl.searchParams.set('language', 'en');
+    geocodingUrl.searchParams.set('format', 'json');
+
+    const geocodingResponse = await fetch(geocodingUrl, { signal: AbortSignal.timeout(8000) });
+    if (!geocodingResponse.ok) throw new Error(`Geocoding returned HTTP ${geocodingResponse.status}.`);
+    const geocoding = await geocodingResponse.json() as {
+      results?: Array<{
+        name: string;
+        latitude: number;
+        longitude: number;
+        timezone: string;
+        country?: string;
+        admin1?: string;
+      }>;
+    };
+    const place = geocoding.results?.[0];
+    if (!place) {
+      return res.status(404).json({ error: `No matching city or place was found for "${location}".` });
+    }
+
+    const forecastUrl = new URL('https://api.open-meteo.com/v1/forecast');
+    forecastUrl.searchParams.set('latitude', String(place.latitude));
+    forecastUrl.searchParams.set('longitude', String(place.longitude));
+    forecastUrl.searchParams.set(
+      'current',
+      'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m',
+    );
+    forecastUrl.searchParams.set('temperature_unit', temperatureUnit);
+    forecastUrl.searchParams.set('timezone', 'auto');
+
+    const forecastResponse = await fetch(forecastUrl, { signal: AbortSignal.timeout(8000) });
+    if (!forecastResponse.ok) throw new Error(`Weather provider returned HTTP ${forecastResponse.status}.`);
+    const forecast = await forecastResponse.json() as {
+      current?: {
+        time?: string;
+        temperature_2m?: number;
+        relative_humidity_2m?: number;
+        apparent_temperature?: number;
+        precipitation?: number;
+        weather_code?: number;
+        wind_speed_10m?: number;
+      };
+      current_units?: { temperature_2m?: string; wind_speed_10m?: string };
+    };
+    const current = forecast.current;
+    if (
+      !current ||
+      typeof current.temperature_2m !== 'number' ||
+      typeof current.weather_code !== 'number'
+    ) {
+      throw new Error('Weather provider returned incomplete current conditions.');
+    }
+
+    const conditions: Record<number, string> = {
+      0: 'Clear sky',
+      1: 'Mainly clear',
+      2: 'Partly cloudy',
+      3: 'Overcast',
+      45: 'Fog',
+      48: 'Rime fog',
+      51: 'Light drizzle',
+      53: 'Moderate drizzle',
+      55: 'Dense drizzle',
+      56: 'Light freezing drizzle',
+      57: 'Dense freezing drizzle',
+      61: 'Light rain',
+      63: 'Moderate rain',
+      65: 'Heavy rain',
+      66: 'Light freezing rain',
+      67: 'Heavy freezing rain',
+      71: 'Light snow',
+      73: 'Moderate snow',
+      75: 'Heavy snow',
+      77: 'Snow grains',
+      80: 'Light rain showers',
+      81: 'Moderate rain showers',
+      82: 'Violent rain showers',
+      85: 'Light snow showers',
+      86: 'Heavy snow showers',
+      95: 'Thunderstorm',
+      96: 'Thunderstorm with light hail',
+      99: 'Thunderstorm with heavy hail',
+    };
+    const locationLabel = [place.name, place.admin1, place.country]
+      .filter((part, index, parts) => Boolean(part) && parts.indexOf(part) === index)
+      .join(', ');
+
+    return res.json({
+      location: locationLabel,
+      temperature: current.temperature_2m,
+      temperatureUnit: forecast.current_units?.temperature_2m || (temperatureUnit === 'fahrenheit' ? '°F' : '°C'),
+      feelsLike: current.apparent_temperature,
+      humidity: current.relative_humidity_2m,
+      precipitation: current.precipitation,
+      windSpeed: current.wind_speed_10m,
+      windSpeedUnit: forecast.current_units?.wind_speed_10m || 'km/h',
+      conditions: conditions[current.weather_code] || 'Conditions unavailable',
+      observedAt: current.time,
+      source: 'https://open-meteo.com/',
+    });
+  } catch (error) {
+    console.error('Weather lookup failed:', error instanceof Error ? error.message : String(error));
+    return res.status(502).json({ error: 'Current weather is temporarily unavailable. Please try again.' });
+  }
+}));
+
+// Chat completion with Google Search Grounding and Multi-file attachments
+app.post('/api/chat', async (req, res) => {
+  let latestText = '';
+  let currentAttachments: unknown[] = [];
+  let reqMessages: Array<{ role: string; content: string }> = [];
+  let isWebSearch = true;
+
+  try {
+    const {
+      messages = [],
+      webSearch = true,
+      model = 'gemini-3.8-flash',
+      attachments = [],
+    } = req.body;
+
+    reqMessages = messages;
+    isWebSearch = webSearch;
+    currentAttachments = attachments;
+
+    if (!messages.length) {
+      return res.status(400).json({ error: 'Messages array is required' });
+    }
+
+    const latestMessage = messages[messages.length - 1];
+    latestText = latestMessage?.content || '';
+
+    if (isImagePrompt(latestText)) {
+      if (!apiKey || apiKey.includes('Placeholder')) {
+        return res.status(503).json({
+          error: 'AI image generation is not configured. Set GEMINI_API_KEY in the server environment.',
+        });
+      }
+
+      try {
+        const imageReferences = Array.isArray(attachments)
+          ? attachments.filter((attachment: ImageReference) => attachment.type?.startsWith('image/'))
+          : [];
+        const result = await generateArtwork(latestText, imageReferences, '1:1');
+        return res.json({
+          role: 'assistant',
+          content: `Here is the artwork for **"${latestText}"**.`,
+          imageUrl: result.imageUrl,
+          grounding: [],
+        });
+      } catch (imageError) {
+        const message = imageError instanceof Error ? imageError.message : String(imageError);
+        console.error('JARVIS image request failed:', message.replace(apiKey, '[redacted]').slice(0, 500));
+        const failure = imageErrorResponse(imageError);
+        return res.status(failure.status).json({ error: failure.message });
+      }
+    }
+
+    // Prepare system instruction
+    const systemInstruction = `You are JARVIS, a helpful general-purpose AI assistant. Answer the user's actual question directly and accurately. Be clear about uncertainty and never invent facts, sources, or actions. Use concise explanations by default, with structured steps or examples when useful. Analyze any attached files or images in the context of the user's request. If live search is unavailable or the answer may be out of date, say so.`;
+
+    // Map conversation history
+    const contents: Array<{ role: string; parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> }> = [];
+
+    // Prior turns (excluding latest)
+    for (let i = 0; i < messages.length - 1; i++) {
+      const msg = messages[i];
+      contents.push({
+        role: msg.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: msg.content || '' }],
+      });
+    }
+
+    // Latest turn parts: include text + up to 10 attached files
+    const latestParts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+
+    // Attach files if any
+    if (attachments && Array.isArray(attachments)) {
+      for (const file of attachments.slice(0, 10)) {
+        if (file.data && file.type) {
+          const base64Data = file.data.includes(',')
+            ? file.data.split(',')[1]
+            : file.data;
+
+          if (file.type.startsWith('image/') || file.type === 'application/pdf') {
+            latestParts.push({
+              inlineData: {
+                mimeType: file.type,
+                data: base64Data,
+              },
+            });
+          } else if (
+            file.type.startsWith('text/') ||
+            file.type === 'application/json' ||
+            file.type === 'application/csv'
+          ) {
+            try {
+              const textContent = Buffer.from(base64Data, 'base64').toString('utf-8');
+              latestParts.push({
+                text: `[Attached Document: "${file.name}" (${file.type})]:\n${textContent.slice(0, 15000)}`,
+              });
+            } catch {
+              latestParts.push({
+                inlineData: {
+                  mimeType: file.type,
+                  data: base64Data,
+                },
+              });
+            }
+          } else {
+            latestParts.push({
+              text: `[The attached file "${file.name}" (${file.type}) cannot be read as text or image by this model.]`,
+            });
+          }
+        }
+      }
+    }
+
+    // Add user's question / instruction
+    latestParts.push({
+      text: latestText || 'Please review the attached files and provide a detailed breakdown.',
+    });
+
+    contents.push({
+      role: 'user',
+      parts: latestParts,
+    });
+
+    // Enable Google Search grounding if webSearch is enabled
+    const tools = webSearch ? [{ googleSearch: {} }] : [];
+
+    // Model selection mapping to currently available Gemini API models.
+    const selectedModel = model === 'jarvis-pro'
+      ? 'gemini-3.1-flash-lite'
+      : 'gemini-flash-lite-latest';
+    let responseText = '';
+    let sources: Array<{ uri: string; title: string }> = [];
+    let webSearchQueries: string[] = [];
+
+    if (process.env.GEMINI_API_KEY && !process.env.GEMINI_API_KEY.includes('Placeholder')) {
+      const primaryTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Primary request timeout (10s)')), 10000)
+      );
+
+      try {
+        const response = await Promise.race([
+          ai.models.generateContent({
+            model: selectedModel,
+            contents,
+            config: {
+              systemInstruction,
+              tools,
+            },
+          }),
+          primaryTimeout,
+        ]);
+
+        responseText = response.text || 'I have processed your request, sir.';
+
+        // Extract grounding sources from Google Search
+        const groundingChunks =
+          response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+        webSearchQueries =
+          response.candidates?.[0]?.groundingMetadata?.webSearchQueries || [];
+
+        sources = groundingChunks
+          .map((chunk: { web?: { uri?: string; title?: string } }) => {
+            if (chunk.web?.uri) {
+              try {
+                const urlHost = new URL(chunk.web.uri).hostname;
+                return {
+                  uri: chunk.web.uri,
+                  title: chunk.web.title || urlHost,
+                };
+              } catch {
+                return {
+                  uri: chunk.web.uri,
+                  title: chunk.web.title || chunk.web.uri,
+                };
+              }
+            }
+            return null;
+          })
+          .filter(Boolean) as Array<{ uri: string; title: string }>;
+      } catch (firstErr) {
+        const firstErrStr = `${(firstErr as Error)?.message || ''}`;
+        const isQuotaOrTimeout =
+          firstErrStr.includes('429') ||
+          firstErrStr.includes('RESOURCE_EXHAUSTED') ||
+          firstErrStr.includes('quota') ||
+          firstErrStr.includes('timeout');
+
+        if (isQuotaOrTimeout && (tools.length > 0 || selectedModel !== 'gemini-flash-lite-latest')) {
+          console.log('Search tool or model timeout/quota limit. Retrying with the available flash model without search tools...');
+          try {
+            const retryTimeout = new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('Retry timeout (8s)')), 8000)
+            );
+            const retryResponse = await Promise.race([
+              ai.models.generateContent({
+                model: 'gemini-flash-lite-latest',
+                contents,
+                config: {
+                  systemInstruction,
+                },
+              }),
+              retryTimeout,
+            ]);
+            responseText = retryResponse.text || '';
+          } catch {
+            throw firstErr;
+          }
+        } else {
+          throw firstErr;
+        }
+      }
+    } else {
+      throw new Error('AI service is not configured. Set GEMINI_API_KEY in the server environment.');
+    }
+
+    return res.json({
+      role: 'assistant',
+      content: responseText,
+      sources,
+      queries: webSearchQueries,
+      modelUsed: selectedModel,
+      timestamp: Date.now(),
+    });
+  } catch (error) {
+    const errStr =
+      typeof error === 'string'
+        ? error
+        : `${(error as Error)?.message || ''} ${JSON.stringify(error) || ''}`;
+
+    const isQuotaError =
+      errStr.includes('429') ||
+      errStr.includes('RESOURCE_EXHAUSTED') ||
+      errStr.includes('quota');
+    const isTimeout = errStr.toLowerCase().includes('timeout') || errStr.toLowerCase().includes('aborted');
+
+    const status = !apiKey || apiKey.includes('Placeholder')
+      ? 503
+      : isQuotaError
+        ? 429
+        : isTimeout
+          ? 504
+          : 502;
+    const message = !apiKey || apiKey.includes('Placeholder')
+      ? 'AI service is not configured. Set GEMINI_API_KEY in the server environment.'
+      : isQuotaError
+        ? 'Google AI reports that this API key has no available quota for the selected model. Image and document analysis require available Gemini quota; enable billing or quota for this Google AI project, then retry.'
+        : isTimeout
+          ? 'The AI provider did not respond in time. Check model availability and try again.'
+          : 'The AI provider could not complete this request. Please try again.';
+
+    console.error('JARVIS request failed:', errStr.slice(0, 300));
+    return res.status(status).json({ error: message });
+  }
+});
+
+// Serve frontend in production or mount Vite middleware in development
+async function startServer() {
+  const http = await import('node:http');
+  const httpServer = http.createServer(app);
+
+  if (process.env.NODE_ENV === 'production') {
+    const staticDirectory = path.basename(__dirname) === 'dist'
+      ? __dirname
+      : path.resolve(__dirname, 'dist');
+    app.use(express.static(staticDirectory));
+    app.get('*', (req, res) => {
+      res.sendFile(path.resolve(staticDirectory, 'index.html'));
+    });
+  } else {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        host: '0.0.0.0',
+        port: PORT,
+        hmr: false,
+      },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`JARVIS AI running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+app.use((error: Error, _req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) return next(error);
+  console.error('Unhandled request error:', error.message);
+  return res.status(500).json({ error: 'Request failed. Please try again.' });
+});
+
+export default app;
+
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  void startServer();
+}
