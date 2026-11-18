@@ -1,3 +1,4 @@
+import { jsPDF } from 'jspdf';
 import { Conversation, UserProfile, AppSettings } from '../types';
 
 const SETTINGS_KEY = 'jarvis_settings_v1';
@@ -100,9 +101,17 @@ export function loadSettings(): AppSettings {
     const raw = sessionStorage.getItem(SETTINGS_KEY);
     if (!raw) return defaultSettings;
     const settings = { ...defaultSettings, ...JSON.parse(raw) };
-    if (settings.selectedModel === 'gemini-3.8-flash' || settings.selectedModel === 'gemini-2.5-flash' || settings.selectedModel === 'gemini-3.5-flash-lite') {
+    if (
+      settings.selectedModel === 'gemini-3.8-flash' ||
+      settings.selectedModel === 'gemini-2.5-flash' ||
+      settings.selectedModel === 'gemini-3.5-flash-lite'
+    ) {
       settings.selectedModel = 'jarvis-turbo';
-    } else if (settings.selectedModel === 'gemini-4-argon' || settings.selectedModel === 'gemini-2.5-pro' || settings.selectedModel === 'gemini-3.1-pro-preview') {
+    } else if (
+      settings.selectedModel === 'gemini-4-argon' ||
+      settings.selectedModel === 'gemini-2.5-pro' ||
+      settings.selectedModel === 'gemini-3.1-pro-preview'
+    ) {
       settings.selectedModel = 'jarvis-pro';
     } else if (settings.selectedModel === 'art-studio') {
       settings.selectedModel = 'jarvis-art';
@@ -120,8 +129,6 @@ export function saveSettings(settings: AppSettings): void {
     console.error('Failed to save settings:', e);
   }
 }
-
-import { jsPDF } from 'jspdf';
 
 // Export conversation utilities
 export function exportConversationToFile(
@@ -291,49 +298,53 @@ export function exportConversationToFile(
   } else if (format === 'html') {
     const appUrl = new URL('/', window.location.origin).toString();
     const escapeHtml = (value: string) =>
-      value.replace(/[&<>"']/g, (character) => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;',
-      })[character] || character);
+      value.replace(/[&<>"']/g, (character) =>
+        ({
+          '&': '&',
+          '<': '<',
+          '>': '>',
+          '"': '"',
+          "'": ''',
+        })[character] || character
+      );
     const safeImageData = (value?: string) =>
-        value && /^data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=\r\n]+$/i.test(value)
-          ? value
-          : null;
-    const messages = conv.messages.map((msg) => {
-      const images = [
-        ...(msg.imageUrl ? [msg.imageUrl] : []),
-        ...(msg.attachments || [])
-          .filter((attachment) => attachment.type.startsWith('image/'))
-          .map((attachment) => attachment.data),
-      ]
-        .map(safeImageData)
-        .filter((image): image is string => image !== null)
-        .map((image) => `<img src="${escapeHtml(image)}" alt="Conversation image">`)
-        .join('');
-      const sources = (msg.sources || [])
-        .map((source) => {
-          const href = /^https?:\/\//i.test(source.uri) ? source.uri : '';
-          return href
-            ? `<li><a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(source.title || href)}</a></li>`
-            : `<li>${escapeHtml(source.title || source.uri)}</li>`;
-        })
-        .join('');
-      const attachments = (msg.attachments || [])
-        .filter((attachment) => !attachment.type.startsWith('image/'))
-        .map((attachment) => `<li>${escapeHtml(attachment.name)}</li>`)
-        .join('');
-      const role = msg.role === 'user' ? 'You' : 'JARVIS';
-      return `<article class="message ${msg.role}">
+      value && /^data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=\r\n]+$/i.test(value)
+        ? value
+        : null;
+    const messages = conv.messages
+      .map((msg) => {
+        const images = [
+          ...(msg.imageUrl ? [msg.imageUrl] : []),
+          ...(msg.attachments || [])
+            .filter((attachment) => attachment.type.startsWith('image/'))
+            .map((attachment) => attachment.data),
+        ]
+          .map(safeImageData)
+          .filter((image): image is string => image !== null)
+          .map((image) => `<img src="${escapeHtml(image)}" alt="Conversation image">`)
+          .join('');
+        const sources = (msg.sources || [])
+          .map((source) => {
+            const href = /^https?:\/\//i.test(source.uri) ? source.uri : '';
+            return href
+              ? `<li><a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(source.title || href)}</a></li>`
+              : `<li>${escapeHtml(source.title || source.uri)}</li>`;
+          })
+          .join('');
+        const attachments = (msg.attachments || [])
+          .filter((attachment) => !attachment.type.startsWith('image/'))
+          .map((attachment) => `<li>${escapeHtml(attachment.name)}</li>`)
+          .join('');
+        const role = msg.role === 'user' ? 'You' : 'JARVIS';
+        return `<article class="message ${msg.role}">
         <div class="message-heading"><strong>${role}</strong><time>${new Date(msg.timestamp).toLocaleString()}</time></div>
         <div class="message-content">${escapeHtml(msg.content).replace(/\n/g, '<br>')}</div>
         ${images ? `<div class="images">${images}</div>` : ''}
         ${attachments ? `<ul class="attachments">${attachments}</ul>` : ''}
         ${sources ? `<details><summary>Sources</summary><ul>${sources}</ul></details>` : ''}
       </article>`;
-    }).join('\n');
+      })
+      .join('\n');
     const htmlTitle = escapeHtml(conv.title);
     const serializedConversation = JSON.stringify(conv).replace(/</g, '\\u003c');
     content = `<!doctype html>
