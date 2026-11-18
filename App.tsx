@@ -549,8 +549,8 @@ export default function App() {
         };
       } else if (weatherRequest) {
         const parameters = new URLSearchParams({
-            location: weatherRequest.location,
-            temperatureUnit: weatherRequest.temperatureUnit,
+          location: weatherRequest.location,
+          temperatureUnit: weatherRequest.temperatureUnit,
         });
         endpoint = `/api/weather?${parameters.toString()}`;
       }
@@ -558,10 +558,10 @@ export default function App() {
       const res = endpoint.startsWith('/api/weather?')
         ? await fetch(endpoint)
         : await fetch(endpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(body),
-            });
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
 
       const data = await readJsonResponse<{
         error?: string;
@@ -847,7 +847,7 @@ export default function App() {
       <ToolsModal
         isOpen={toolsModalOpen}
         onClose={() => setToolsModalOpen(false)}
-        onInsertPrompt={(text) => handleSendMessage(text, [])}
+        onInsertPrompt={(text: string) => handleSendMessage(text, [])}
       />
     </div>
   );
